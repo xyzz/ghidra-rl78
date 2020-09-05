@@ -1,0 +1,1866 @@
+define endian=little;
+
+define space memory type=ram_space size=4 wordsize=1 default;
+
+# thx to https://github.com/NationalSecurityAgency/ghidra/issues/773 for the idea
+define pcodeop segment;
+
+# TODO: change PSW handling to pack/unpack on PUSH/POP/other ops and store flags as 1 byte each
+
+define space register type=register_space size=4;
+
+define register offset=0x110000 size=8 contextreg;
+
+define context contextreg
+	cond_skc  = (0, 1) noflow
+	cond_sknc = (1, 2) noflow
+	cond_skz  = (2, 3) noflow
+	cond_sknz = (3, 4) noflow
+	cond_skh  = (4, 5) noflow
+	cond_sknh = (5, 6) noflow
+;
+
+define register offset=0xFFEF8 size=1 [
+	X A C B E D L H
+];
+
+define register offset=0xFFEF8 size=2 [
+	AX BC DE HL
+];
+
+# TODO: what offset/size should this be?
+define register offset=0x100000 size=3 [
+	PC
+];
+
+define register offset=0xFFFF8 size=2 [
+	SP
+];
+
+define register offset=0xFFFF8 size=1 [
+	SPL SPH PSW RESERVED CS ES PMC MEM
+];
+
+@define CY   "PSW[0,1]"
+@define ISP0 "PSW[1,1]"
+@define ISP1 "PSW[2,1]"
+@define RBS0 "PSW[3,1]"
+@define AC   "PSW[4,1]"
+@define RBS1 "PSW[5,1]"
+@define Z    "PSW[6,1]"
+@define IE   "PSW[7,1]"
+
+define token opcode1(8)
+	op = (0, 7)
+	jdisp8 = (0, 7) signed
+	byte = (0, 7)
+	byte1 = (0, 7)
+	byte2 = (0, 7)
+	addr_abs8 = (0, 7)
+;
+
+define token opcode2(16)
+	jdisp16 = (0, 15) signed
+	word = (0, 15)
+	addr_abs16 = (0, 15)
+;
+
+define token opcode3(24)
+	addr_abs20 = (0, 23)
+;
+
+define pcodeop sel;
+define pcodeop halt;
+define pcodeop stop;
+
+#
+# Conditional single-instruction skip
+#
+
+:^instruction is cond_skc=1 & instruction [ cond_skc = 0; ] {
+	if ($(CY) == 1) goto <skip>;
+	build instruction;
+	<skip>
+}
+
+:^instruction is cond_sknc=1 & instruction [ cond_sknc = 0; ] {
+	if ($(CY) == 0) goto <skip>;
+	build instruction;
+	<skip>
+}
+
+:^instruction is cond_skz=1 & instruction [ cond_skz = 0; ] {
+	if ($(Z) == 1) goto <skip>;
+	build instruction;
+	<skip>
+}
+
+:^instruction is cond_sknz=1 & instruction [ cond_sknz = 0; ] {
+	if ($(Z) == 0) goto <skip>;
+	build instruction;
+	<skip>
+}
+
+:^instruction is cond_skh=1 & instruction [ cond_skh = 0; ] {
+	if (($(Z) | $(CY)) == 0) goto <skip>;
+	build instruction;
+	<skip>
+}
+
+:^instruction is cond_sknh=1 & instruction [ cond_sknh = 0; ] {
+	if (($(Z) | $(CY)) == 1) goto <skip>;
+	build instruction;
+	<skip>
+}
+
+#
+# Branch targets
+#
+
+tgt_rel8: target is jdisp8 [ target = inst_next + jdisp8; ] { export *:4 target; }
+
+tgt_rel16: target is jdisp16 [ target = inst_next + jdisp16; ] { export *:4 target; }
+
+tgt_addr16b: target is addr_abs16 [ target = 0xF0000 + addr_abs16; ] { export *:1 target; }
+tgt_addr16w: target is addr_abs16 [ target = 0xF0000 + addr_abs16; ] { export *:2 target; }
+tgt_addr16d: target is addr_abs16 [ target = 0xF0000 + addr_abs16; ] { export *:4 target; }
+
+tgt_addr16_0: target is addr_abs16 [ target = 0 + addr_abs16; ] { export *:4 target; }
+
+tgt_esaddr16b: ES:!addr_abs16 is ES & addr_abs16 { local tmp:4 = segment(ES, addr_abs16:2); export *:1 tmp; }
+tgt_esaddr16w: ES:!addr_abs16 is ES & addr_abs16 { local tmp:4 = segment(ES, addr_abs16:2); export *:2 tmp; }
+
+tgt_addr20: target is addr_abs20 [ target = 0 + addr_abs20; ] { export *:4 target; }
+
+{% for off in range(256) %}
+tgt_saddrb: target is addr_abs8={{ off }} [ target = {% if off < 32 %}{{ 1048320 + off }}{% else %}{{ 1048064 + off }}{% endif %}; ] { export *:1 target; }
+tgt_saddrw: target is addr_abs8={{ off }} [ target = {% if off < 32 %}{{ 1048320 + off }}{% else %}{{ 1048064 + off }}{% endif %}; ] { export *:2 target; }
+{% endfor %}
+
+# TODO: see "List of Fixed SFR" - should map on registers. instructions might operate on sfr directly
+
+tgt_sfrb: target is addr_abs8 [ target = 0xfff00 + addr_abs8; ] { export *:1 target; }
+tgt_sfrw: target is addr_abs8 [ target = 0xfff00 + addr_abs8; ] { export *:2 target; }
+
+#
+# 8-bit data transfer
+#
+
+{% for reg, op in [('X','0x50'),('A','0x51'),('C','0x52'),('B','0x53'),('E','0x54'),('D','0x55'),('L','0x56'),('H','0x57')] %}
+:MOV {{ reg }}, #byte is op={{ op }} & {{ reg }} ; byte {
+	{{ reg }} = byte;
+}
+{% endfor %}
+
+:MOV tgt_saddrb, #byte is op=0xCD ; tgt_saddrb ; byte {
+	tgt_saddrb = byte;
+}
+
+:MOV tgt_sfrb, #byte is op=0xCE ; tgt_sfrb ; byte {
+	tgt_sfrb = byte;
+}
+
+:MOV !tgt_addr16b, #byte is op=0xCF ; tgt_addr16b ; byte {
+	tgt_addr16b = byte;
+}
+
+{% for dst,src,op in [('A','X','0x60'),('A','C','0x62'),('A','B','0x63'),('A','E','0x64'),('A','D','0x65'),('A','L','0x66'),('A','H','0x67'),
+	('X','A','0x70'),('C','A','0x72'),('B','A','0x73'),('E','A','0x74'),('D','A','0x75'),('L','A','0x76'),('H','A','0x77'),] %}
+:MOV {{ dst }}, {{ src }} is op={{ op }} & {{ dst }} & {{ src }} {
+	{{ dst }} = {{ src }};
+}
+{% endfor %}
+
+:MOV A, tgt_saddrb is op=0x8D & A ; tgt_saddrb {
+	A = tgt_saddrb;
+}
+
+:MOV tgt_saddrb, A is op=0x9D & A ; tgt_saddrb {
+	tgt_saddrb = A;
+}
+
+:MOV A, tgt_sfrb is op=0x8E & A ; tgt_sfrb {
+	A = tgt_sfrb;
+}
+
+:MOV tgt_sfrb, A is op=0x9E & A ; tgt_sfrb {
+	tgt_sfrb = A;
+}
+
+:MOV A, !tgt_addr16b is op=0x8F & A ; tgt_addr16b {
+	A = tgt_addr16b;
+}
+
+:MOV !tgt_addr16b, A is op=0x9F & A ; tgt_addr16b {
+	tgt_addr16b = A;
+}
+
+:MOV PSW, #byte is PSW & op=0xCE ; op=0xFA ; byte {
+	PSW = byte;
+}
+
+:MOV A, PSW is A & PSW & op=0x8E ; op=0xFA {
+	A = PSW;
+}
+
+:MOV PSW, A is PSW & A & op=0x9E ; op=0xFA {
+	PSW = A;
+}
+
+:MOV ES, #byte is ES & op=0x41 ; byte {
+	ES = byte;
+}
+
+:MOV ES, tgt_saddrb is ES & op=0x61 ; op=0xB8 ; tgt_saddrb {
+	ES = tgt_saddrb;
+}
+
+:MOV A, ES is A & ES & op=0x8E ; op=0xFD {
+	A = ES;
+}
+
+:MOV ES, A is ES & A & op=0x9E ; op=0xFD {
+	ES = A;
+}
+
+:MOV CS, #byte is CS & op=0xCE ; op=0xFC ; byte {
+	CS = byte;
+}
+
+:MOV A, CS is A & CS & op=0x8E ; op=0xFC {
+	A = CS;
+}
+
+:MOV CS, A is CS & A & op=0x9E ; op=0xFC {
+	CS = A;
+}
+
+{% for reg,off in [('DE',0),('HL',2)] %}
+:MOV A, [{{ reg }}] is A & {{ reg }} & op={{ 137 + off }} {
+	local addr:4 = segment(0xF:2, {{reg}});
+	A = *:1 addr;
+}
+
+:MOV [{{ reg }}], A is {{ reg }} & A & op={{ 153 + off }} {
+	local addr:4 = segment(0xF:2, {{reg}});
+	*:1 addr = A;
+}
+
+:MOV [{{ reg }}+byte1], #byte2 is {{ reg }} & op={{ 202 + off }} ; byte1 ; byte2 {
+	local addr:4 = segment(0xF:2, {{reg}} + byte1);
+	*:1 addr = byte2;
+}
+
+:MOV A, [{{ reg }}+byte] is A & {{ reg }} & op={{ 138 + off }} ; byte {
+	local addr:4 = segment(0xF:2, {{reg}} + byte);
+	A = *:1 addr;
+}
+
+:MOV [{{ reg }}+byte], A is {{ reg }} & A & op={{ 154 + off }} ; byte {
+	local addr:4 = segment(0xF:2, {{reg}} + byte);
+	*:1 addr = A;
+}
+{% endfor %}
+
+:MOV A, [HL+B] is A & HL & B & op=0x61 ; op=0xC9 {
+	local addr:4 = segment(0xF:2, HL + zext(B));
+	A = *:1 addr;
+}
+
+:MOV [HL+B], A is HL & B & A & op=0x61 ; op=0xD9 {
+	local addr:4 = segment(0xF:2, HL + zext(B));
+	*:1 addr = A;
+}
+
+:MOV A, [HL+C] is A & HL & C & op=0x61 ; op=0xE9 {
+	local addr:4 = segment(0xF:2, HL + zext(C));
+	A = *:1 addr;
+}
+
+:MOV [HL+C], A is HL & C & A & op=0x61 ; op=0xF9 {
+	local addr:4 = segment(0xF:2, HL + zext(C));
+	*:1 addr = A;
+}
+
+:MOV word[B], #byte is B & op=0x19 ; word ; byte {
+	local addr:4 = segment(0xF:2, word:2) + zext(B);
+	*:1 addr = byte;
+}
+
+:MOV A, word[B] is A & B & op=0x09 ; word {
+	local addr:4 = segment(0xF:2, word:2) + zext(B);
+	A = *:1 addr;
+}
+
+:MOV word[B], A is B & A & op=0x18 ; word {
+	local addr:4 = segment(0xF:2, word:2) + zext(B);
+	*:1 addr = A;
+}
+
+:MOV word[C], #byte is C & op=0x38 ; word ; byte {
+	local addr:4 = segment(0xF:2, word:2) + zext(C);
+	*:1 addr = byte;
+}
+
+:MOV A, word[C] is A & C & op=0x29 ; word {
+	local addr:4 = segment(0xF:2, word:2) + zext(C);
+	A = *:1 addr;
+}
+
+:MOV word[C], A is C & A & op=0x28 ; word {
+	local addr:4 = segment(0xF:2, word:2) + zext(C);
+	*:1 addr = A;
+}
+
+:MOV word[BC], #byte is BC & op=0x39 ; word ; byte {
+	local addr:4 = segment(0xF:2, word:2) + zext(BC);
+	*:1 addr = byte;
+}
+
+:MOV A, word[BC] is A & BC & op=0x49 ; word {
+	local addr:4 = segment(0xF:2, word:2) + zext(BC);
+	A = *:1 addr;
+}
+
+:MOV word[BC], A is BC & A & op=0x48 ; word {
+	local addr:4 = segment(0xF:2, word:2) + zext(BC);
+	*:1 addr = A;
+}
+
+:MOV [SP+byte1], #byte2 is SP & op=0xC8 ; byte1 ; byte2 {
+	local addr:4 = segment(0xF:2, SP + byte1);
+	*:1 addr = byte2;
+}
+
+:MOV A, [SP+byte] is A & SP & op=0x88 ; byte {
+	local addr:4 = segment(0xF:2, SP + byte);
+	A = *:1 addr;
+}
+
+:MOV [SP+byte], A is SP & A & op=0x98 ; byte {
+	local addr:4 = segment(0xF:2, SP + byte);
+	*:1 addr = A;
+}
+
+{% for reg,off in [('B',224), ('C',240), ('X',208)] %}
+:MOV {{ reg }}, tgt_saddrb is {{ reg }} & op={{ off+8 }} ; tgt_saddrb {
+	{{ reg }} = tgt_saddrb;
+}
+
+:MOV {{ reg }}, !tgt_addr16b is {{ reg }} & op={{ off+9 }} ; tgt_addr16b {
+	{{ reg }} = tgt_addr16b;
+}
+{% endfor %}
+
+:MOV tgt_esaddr16b, #byte is op=0x11 ; op=0xCF ; tgt_esaddr16b ; byte {
+	tgt_esaddr16b = byte;
+}
+
+:MOV A, tgt_esaddr16b is A & op=0x11 ; op=0x8F ; tgt_esaddr16b {
+	A = tgt_esaddr16b;
+}
+
+:MOV tgt_esaddr16b, A is A & op=0x11 ; op=0x9F ; tgt_esaddr16b {
+	tgt_esaddr16b = A;
+}
+
+:MOV A, ES:[DE] is A & ES & DE & op=0x11 ; op=0x89 {
+	local addr:4 = segment(ES, DE);
+	A = *:1 addr;
+}
+
+:MOV ES:[DE], A is ES & DE & A & op=0x11 ; op=0x99 {
+	local addr:4 = segment(ES, DE);
+	*:1 addr = A;
+}
+
+:MOV ES:[DE+byte1], #byte2 is ES & DE & op=0x11 ; op=0xCA ; byte1 ; byte2 {
+	local addr:4 = segment(ES, DE + byte1);
+	*:1 addr = byte2;
+}
+
+:MOV A, ES:[DE+byte] is A & ES & DE & op=0x11 ; op=0x8A ; byte {
+	local addr:4 = segment(ES, DE + byte);
+	A = *:1 addr;
+}
+
+:MOV ES:[DE+byte], A is ES & DE & A & op=0x11 ; op=0x9A ; byte {
+	local addr:4 = segment(ES, DE + byte);
+	*:1 addr = A;
+}
+
+:MOV A, ES:[HL] is A & ES & HL & op=0x11 ; op=0x8B {
+	local addr:4 = segment(ES, HL);
+	A = *:1 addr;
+}
+
+:MOV ES:[HL], A is ES & HL & A & op=0x11 ; op=0x9B {
+	local addr:4 = segment(ES, HL);
+	*:1 addr = A;
+}
+
+:MOV ES:[HL+byte1], #byte2 is ES & HL & op=0x11 ; op=0xCC ; byte1 ; byte2 {
+	local addr:4 = segment(ES, HL + byte1);
+	*:1 addr = byte2;
+}
+
+:MOV A, ES:[HL+byte] is A & ES & HL & op=0x11 ; op=0x8C ; byte {
+	local addr:4 = segment(ES, HL + byte);
+	A = *:1 addr;
+}
+
+:MOV ES:[HL+byte], A is ES & HL & A ; op=0x11 ; op=0x9C ; byte {
+	local addr:4 = segment(ES, HL + byte);
+	*:1 addr = A;
+}
+
+:MOV A, ES:[HL+B] is A & ES & HL & B & op=0x11 ; op=0x61 ; op=0xC9 {
+	local addr:4 = segment(ES, HL + zext(B));
+	A = *:1 addr;
+}
+
+:MOV ES:[HL+B], A is ES & HL & B & A & op=0x11 ; op=0x61 ; op=0xD9 {
+	local addr:4 = segment(ES, HL + zext(B));
+	*:1 addr = A;
+}
+
+:MOV A, ES:[HL+C] is A & ES & HL & C & op=0x11 ; op=0x61 ; op=0xE9 {
+	local addr:4 = segment(ES, HL + zext(C));
+	A = *:1 addr;
+}
+
+:MOV ES:[HL+C], A is ES & HL & C & A & op=0x11 ; op=0x61 ; op=0xF9 {
+	local addr:4 = segment(ES, HL + zext(C));
+	*:1 addr = A;
+}
+
+:MOV ES:word[B], #byte is ES & B & op=0x11 ; op=0x19 ; word ; byte {
+	local addr:4 = segment(ES, word:2) + zext(B);
+	*:1 addr = byte;
+}
+
+:MOV A, ES:word[B] is A & ES & B & op=0x11 ; op=0x09 ; word {
+	local addr:4 = segment(ES, word:2) + zext(B);
+	A = *:1 addr;
+}
+
+:MOV ES:word[B], A is ES &  B & A & op=0x11 ; op=0x18 ; word {
+	local addr:4 = segment(ES, word:2) + zext(B);
+	*:1 addr = A;
+}
+
+:MOV ES:word[C], #byte is ES & C & op=0x11 ; op=0x38 ; word ; byte {
+	local addr:4 = segment(ES, word:2) + zext(C);
+	*:1 addr = byte;
+}
+
+:MOV A, ES:word[C] is A & ES & C & op=0x11 ; op=0x29 ; word {
+	local addr:4 = segment(ES, word:2) + zext(C);
+	A = *:1 addr;
+}
+
+:MOV ES:word[C], A is ES & C & A & op=0x11 ; op=0x28 ; word {
+	local addr:4 = segment(ES, word:2) + zext(C);
+	*:1 addr = A;
+}
+
+:MOV ES:word[BC], #byte is ES & BC & op=0x11 ; op=0x39 ; word ; byte {
+	local addr:4 = segment(ES, word:2) + zext(BC);
+	*:1 addr = byte;
+}
+
+:MOV A, ES:word[BC] is A & ES & BC & op=0x11 ; op=0x49 ; word {
+	local addr:4 = segment(ES, word:2) + zext(BC);
+	A = *:1 addr;
+}
+
+:MOV ES:word[BC], A is ES & BC & A & op=0x11 ; op=0x48 ; word {
+	local addr:4 = segment(ES, word:2) + zext(BC);
+	*:1 addr = A;
+}
+
+:MOV B, tgt_esaddr16b is B & op=0x11 ; op=0xE9 ; tgt_esaddr16b {
+	B = tgt_esaddr16b;
+}
+
+:MOV C, tgt_esaddr16b is C & op=0x11 ; op=0xF9 ; tgt_esaddr16b {
+	C = tgt_esaddr16b;
+}
+
+:MOV X, tgt_esaddr16b is X & op=0x11 ; op=0xD9 ; tgt_esaddr16b {
+	X = tgt_esaddr16b;
+}
+
+{% macro xch(op1, op2) %}
+	local a = {{op1}};
+	local b = {{op2}};
+	{{op1}} = b;
+	{{op2}} = a;
+{% endmacro %}
+
+:XCH A, X is A & X & op=0x08 {
+	{{ xch('A', 'X') }}
+}
+
+{% for reg,op in [('C','0x8A'), ('B','0x8B'), ('E','0x8C'), ('D','0x8D'), ('L','0x8E'), ('H','0x8F')] %}
+:XCH A, {{reg}} is A & {{reg}} & op=0x61 ; op={{op}} {
+	{{ xch('A', reg) }}
+}
+{% endfor %}
+
+:XCH A, tgt_saddrb is A & op=0x61 ; op=0xA8 ; tgt_saddrb {
+	{{ xch('A', 'tgt_saddrb') }}
+}
+
+:XCH A, tgt_sfrb is A & op=0x61 ; op=0xAB ; tgt_sfrb {
+	{{ xch('A', 'tgt_sfrb') }}
+}
+
+:XCH A, !tgt_addr16b is A & op=0x61 ; op=0xAA ; tgt_addr16b {
+	{{ xch('A', 'tgt_addr16b') }}
+}
+
+:XCH A, [DE] is A & DE & op=0x61 ; op=0xAE {
+	local addr:4 = segment(0xF:2, DE);
+	{{ xch('A', '*:1 addr') }}
+}
+
+:XCH A, [DE+byte] is A & DE & op=0x61 ; op=0xAF ; byte {
+	local addr:4 = segment(0xF:2, DE);
+	{{ xch('A', '*:1 addr') }}
+}
+
+:XCH A, [HL] is A & HL & op=0x61 ; op=0xAC {
+	local addr:4 = segment(0xF:2, HL);
+	{{ xch('A', '*:1 addr') }}
+}
+
+:XCH A, [HL+byte] is A & HL & op=0x61 ; op=0xAD ; byte {
+	local addr:4 = segment(0xF:2, HL + byte);
+	{{ xch('A', '*:1 addr') }}
+}
+
+:XCH A, [HL+B] is A & HL & B & op=0x61 ; op=0xB9 {
+	local addr:4 = segment(0xF:2, HL + zext(B));
+	{{ xch('A', '*:1 addr') }}
+}
+
+:XCH A, [HL+C] is A & HL & C & op=0x61 ; op=0xA9 {
+	local addr:4 = segment(0xF:2, HL + zext(C));
+	{{ xch('A', '*:1 addr') }}
+}
+
+:XCH A, tgt_esaddr16b is A & op=0x11 ; op=0x61 ; op=0xAA ; tgt_esaddr16b {
+	{{ xch('A', 'tgt_esaddr16b') }}
+}
+
+:XCH A, ES:[DE] is ES & A & DE & op=0x11 ; op=0x61 ; op=0xAE {
+	local addr:4 = segment(ES, DE);
+	{{ xch('A', '*:1 addr') }}
+}
+
+:XCH A, ES:[DE+byte] is ES & A & DE & op=0x11 ; op=0x61 ; op=0xAF ; byte {
+	local addr:4 = segment(ES, DE);
+	{{ xch('A', '*:1 addr') }}
+}
+
+:XCH A, ES:[HL] is ES & A & HL & op=0x11 ; op=0x61 ; op=0xAC {
+	local addr:4 = segment(ES, HL);
+	{{ xch('A', '*:1 addr') }}
+}
+
+:XCH A, ES:[HL+byte] is ES & A & HL & op=0x11 ; op=0x61 ; op=0xAD ; byte {
+	local addr:4 = segment(ES, HL + byte);
+	{{ xch('A', '*:1 addr') }}
+}
+
+:XCH A, ES:[HL+B] is ES & A & HL & B & op=0x11 ; op=0x61 ; op=0xB9 {
+	local addr:4 = segment(ES, HL + zext(B));
+	{{ xch('A', '*:1 addr') }}
+}
+
+:XCH A, ES:[HL+C] is ES & A & HL & C & op=0x11 ; op=0x61 ; op=0xA9 {
+	local addr:4 = segment(ES, HL + zext(C));
+	{{ xch('A', '*:1 addr') }}
+}
+
+{% macro oneb(tgt) %}
+	{{ tgt }} = 1;
+{% endmacro %}
+
+{% macro clrb(tgt) %}
+	{{ tgt }} = 0;
+{% endmacro %}
+
+{% for fun,name,off in [(oneb,"ONEB",224),(clrb,"CLRB",240)] %}
+	:{{name}} A is A & op={{ off+1 }} {
+		{{ fun('A') }}
+	}
+	:{{name}} X is X & op={{ off }} {
+		{{ fun('X') }}
+	}
+	:{{name}} B is B & op={{ off+3 }} {
+		{{ fun('B') }}
+	}
+	:{{name}} C is C & op={{ off+2 }} {
+		{{ fun('C') }}
+	}
+
+	:{{name}} tgt_saddrb is op={{ off+4 }} ; tgt_saddrb {
+		{{ fun('tgt_saddrb') }}
+	}
+
+	:{{name}} !tgt_addr16b is op={{ off+5 }} ; tgt_addr16b {
+		{{ fun('tgt_addr16b') }}
+	}
+
+	:{{name}} tgt_esaddr16b is op=0x11 ; op={{ off+5 }} ; tgt_esaddr16b {
+		{{ fun('tgt_esaddr16b') }}
+	}
+{% endfor %}
+
+:MOVS [HL+byte], X is HL & X & op=0x61 ; op=0xCE ; byte {
+	local addr:4 = segment(0xF:2, HL + byte);
+	*:1 addr = X;
+	$(Z) = (X == 0);
+	$(CY) = (X == 0) || (A == 0);
+}
+
+:MOVS ES:[HL+byte], X is ES & HL & X & op=0x11 ; op=0x61 ; op=0xCE ; byte {
+	local addr:4 = segment(ES, HL + byte);
+	*:1 addr = X;
+	$(Z) = (X == 0);
+	$(CY) = (X == 0) || (A == 0);
+}
+
+#
+# 16-bit data transfer
+#
+
+{% for reg, op in [('AX','0x30'), ('BC','0x32'), ('DE','0x34'), ('HL','0x36')] %}
+:MOVW {{ reg }}, #word is op={{ op }} & {{ reg }} ; word {
+	{{ reg }} = word;
+}
+{% endfor %}
+
+:MOVW tgt_saddrw, #word is op=0xC9 ; tgt_saddrw ; word {
+	tgt_saddrw = word;
+}
+
+:MOVW tgt_sfrw, #word is op=0xCB ; tgt_sfrw ; word {
+	tgt_sfrw = word;
+}
+
+:MOVW AX, tgt_saddrw is AX & op=0xAD ; tgt_saddrw {
+	AX = tgt_saddrw;
+}
+
+:MOVW tgt_saddrw, AX is AX & op=0xBD ; tgt_saddrw {
+	tgt_saddrw = AX;
+}
+
+:MOVW AX, tgt_sfrw is AX & op=0xAE ; tgt_sfrw {
+	AX = tgt_sfrw;
+}
+
+:MOVW tgt_sfrw, AX is AX & op=0xBE ; tgt_sfrw {
+	tgt_sfrw = AX;
+}
+
+{% for (dst,src,op) in [('AX','BC','0x13'),('AX','DE','0x15'),('AX','HL','0x17'),('BC','AX','0x12'),('DE','AX','0x14'),('HL','AX','0x16')] %}
+	:MOVW {{dst}},{{src}} is {{dst}} & {{src}} & op={{op}} {
+		{{dst}} = {{src}};
+	}
+{% endfor %}
+
+:MOVW AX, !tgt_addr16w is AX & op=0xAF ; tgt_addr16w {
+	AX = tgt_addr16w;
+}
+
+:MOVW !tgt_addr16w, AX is AX & op=0xBF ; tgt_addr16w {
+	tgt_addr16w = AX;
+}
+
+:MOVW AX, [DE] is AX & DE & op=0xA9 {
+	local addr:4 = segment(0xF:2, DE);
+	AX = *:2 addr;
+}
+
+:MOVW [DE], AX is DE & AX & op=0xB9 {
+	local addr:4 = segment(0xF:2, DE);
+	*:2 addr = AX;
+}
+
+:MOVW AX, [DE+byte] is AX & DE & op=0xAA ; byte {
+	local addr:4 = segment(0xF:2, DE + byte);
+	AX = *:2 addr;
+}
+
+:MOVW [DE+byte], AX is DE & AX & op=0xBA ; byte {
+	local addr:4 = segment(0xF:2, DE + byte);
+	*:2 addr = AX;
+}
+
+:MOVW AX, [HL] is AX & HL & op=0xAB {
+	local addr:4 = segment(0xF:2, HL);
+	AX = *:2 addr;
+}
+
+:MOVW [HL], AX is HL & AX & op=0xBB {
+	local addr:4 = segment(0xF:2, HL);
+	*:2 addr = AX;
+}
+
+:MOVW AX, [HL+byte] is AX & HL & op=0xAC ; byte {
+	local addr:4 = segment(0xF:2, HL + byte);
+	AX = *:2 addr;
+}
+
+:MOVW [HL+byte], AX is HL & AX & op=0xBC ; byte {
+	local addr:4 = segment(0xF:2, HL + byte);
+	*:2 addr = AX;
+}
+
+:MOVW AX, word[B] is AX & B & op=0x59 ; word {
+	local addr:4 = segment(0xF:2, word:2) + zext(B);
+	AX = *:2 addr;
+}
+
+:MOVW word[B], AX is B & AX & op=0x58 ; word {
+	local addr:4 = segment(0xF:2, word:2) + zext(B);
+	*:2 addr = AX;
+}
+
+:MOVW AX, word[C] is AX & C & op=0x69 ; word {
+	local addr:4 = segment(0xF:2, word:2) + zext(C);
+	AX = *:2 addr;
+}
+
+:MOVW word[C], AX is C & AX & op=0x68 ; word {
+	local addr:4 = segment(0xF:2, word:2) + zext(C);
+	*:2 addr = AX;
+}
+
+:MOVW AX, word[BC] is AX & BC & op=0x79 ; word {
+	local addr:4 = segment(0xF:2, word:2) + zext(BC);
+	AX = *:2 addr;
+}
+
+:MOVW word[BC], AX is BC & AX & op=0x78 ; word {
+	local addr:4 = segment(0xF:2, word:2) + zext(BC);
+	*:2 addr = AX;
+}
+
+:MOVW AX, [SP+byte] is AX & SP & op=0xA8 ; byte {
+	local addr:4 = segment(0xF:2, SP + byte);
+	AX = *:2 addr;
+}
+
+:MOVW [SP+byte], AX is SP & AX & op=0xB8 ; byte {
+	local addr:4 = segment(0xF:2, SP + byte);
+	*:2 addr = AX;
+}
+
+:MOVW BC, tgt_saddrw is BC & op=0xDA ; tgt_saddrw {
+	BC = tgt_saddrw;
+}
+
+:MOVW BC, !tgt_addr16w is BC & op=0xDB ; tgt_addr16w {
+	BC = tgt_addr16w;
+}
+
+:MOVW DE, tgt_saddrw is DE & op=0xEA ; tgt_saddrw {
+	DE = tgt_saddrw;
+}
+
+:MOVW DE, !tgt_addr16w is DE & op=0xEB ; tgt_addr16w {
+	DE = tgt_addr16w;
+}
+
+:MOVW HL, tgt_saddrw is HL & op=0xFA ; tgt_saddrw {
+	HL = tgt_saddrw;
+}
+
+:MOVW HL, !tgt_addr16w is HL & op=0xFb ; tgt_addr16w {
+	HL = tgt_addr16w;
+}
+
+:MOVW AX, tgt_esaddr16w is AX & op=0x11 ; op=0xAF ; tgt_esaddr16w {
+	AX = tgt_esaddr16w;
+}
+
+:MOVW tgt_esaddr16w, AX is AX & op=0x11 ; op=0xBF ; tgt_esaddr16w {
+	tgt_esaddr16w = AX;
+}
+
+:MOVW AX, ES:[DE] is AX & ES & DE & op=0x11 ; op=0xA9 {
+	local addr:4 = segment(ES, DE);
+	AX = *:2 addr;
+}
+
+:MOVW ES:[DE], AX is ES & DE & AX & op=0x11 ; op=0xB9 {
+	local addr:4 = segment(ES, DE);
+	*:2 addr = AX;
+}
+
+:MOVW AX, ES:[DE+byte] is AX & ES & DE & op=0x11 ; op=0xAA ; byte {
+	local addr:4 = segment(ES, DE + byte);
+	AX = *:2 addr;
+}
+
+:MOVW ES:[DE+byte], AX is ES & DE & AX & op=0x11 ; op=0xBA ; byte {
+	local addr:4 = segment(ES, DE + byte);
+	*:2 addr = AX;
+}
+
+:MOVW AX, ES:[HL] is AX & ES & HL & op=0x11 ; op=0xAB {
+	local addr:4 = segment(ES, HL);
+	AX = *:2 addr;
+}
+
+:MOVW ES:[HL], AX is ES & HL & AX & op=0x11 ; op=0xBB {
+	local addr:4 = segment(ES, HL);
+	*:2 addr = AX;
+}
+
+:MOVW AX, ES:[HL+byte] is AX & ES & HL & op=0x11 ; op=0xAC ; byte {
+	local addr:4 = segment(ES, HL + byte);
+	AX = *:2 addr;
+}
+
+:MOVW ES:[HL+byte], AX is ES & HL & AX & op=0x11 ; op=0xBC ; byte {
+	local addr:4 = segment(ES, HL + byte);
+	*:2 addr = AX;
+}
+
+:MOVW AX, ES:word[B] is AX & ES & B & op=0x11 ; op=0x59 ; word {
+	local addr:4 = segment(ES, word:2) + zext(B);
+	AX = *:2 addr;
+}
+
+:MOVW ES:word[B], AX is ES & B & AX & op=0x11 ; op=0x58 ; word {
+	local addr:4 = segment(ES, word:2) + zext(B);
+	*:2 addr = AX;
+}
+
+:MOVW AX, ES:word[C] is AX & ES & C & op=0x11 ; op=0x69 ; word {
+	local addr:4 = segment(ES, word:2) + zext(C);
+	AX = *:2 addr;
+}
+
+:MOVW ES:word[C], AX is ES & C & AX & op=0x11 ; op=0x68 ; word {
+	local addr:4 = segment(ES, word:2) + zext(C);
+	*:2 addr = AX;
+}
+
+:MOVW AX, ES:word[BC] is AX & ES & BC & op=0x11 ; op=0x79 ; word {
+	local addr:4 = segment(ES, word:2) + zext(BC);
+	AX = *:2 addr;
+}
+
+:MOVW ES:word[BC], AX is ES & BC & AX & op=0x11 ; op=0x78 ; word {
+	local addr:4 = segment(ES, word:2) + zext(BC);
+	*:2 addr = AX;
+}
+
+:MOVW BC, tgt_esaddr16w is BC & op=0x11 ; op=0xDB ; tgt_esaddr16w {
+	BC = tgt_esaddr16w;
+}
+
+:MOVW DE, tgt_esaddr16w is DE & op=0x11 ; op=0xEB ; tgt_esaddr16w {
+	DE = tgt_esaddr16w;
+}
+
+:MOVW HL, tgt_esaddr16w is HL & op=0x11 ; op=0xFB ; tgt_esaddr16w {
+	HL = tgt_esaddr16w;
+}
+
+:XCHW AX, BC is AX & BC & op=0x33 {
+	local tmp = AX;
+	AX = BC;
+	BC = tmp;
+}
+
+:XCHW AX, DE is AX & DE & op=0x35 {
+	local tmp = AX;
+	AX = DE;
+	DE = tmp;
+}
+
+:XCHW AX, HL is AX & HL & op=0x37 {
+	local tmp = AX;
+	AX = HL;
+	HL = tmp;
+}
+
+:ONEW AX is op=0xE6 & AX {
+	AX = 1;
+}
+
+:ONEW BC is op=0xE7 & BC {
+	BC = 1;
+}
+
+:CLRW AX is op=0xF6 & AX {
+	AX = 0;
+}
+
+:CLRW BC is op=0xF7 & BC {
+	BC = 0;
+}
+
+#
+# 8-bit operation
+#
+
+{% macro add(dst, src) %}
+	local op1 = {{ dst }};
+	local op2 = {{ src }};
+	local res = op1 + op2;
+	$(Z) = (res == 0);
+	$(AC) = ((((op1 & 0xf) + (op2 & 0xf)) & 0x10) == 0x10);
+	$(CY) = carry(op1, op2);
+	{{ dst }} = res;
+{% endmacro %}
+
+{% macro addc(dst, src) %}
+	local op1 = {{ dst }};
+	local op2 = {{ src }};
+	local cy = $(CY);
+	local tmp = op1 + op2;
+	$(AC) = ((((op1 & 0xf) + (op2 & 0xf) + cy) & 0x10) == 0x10);
+	$(CY) = carry(op1, op2) || carry(tmp, cy);
+	local res = tmp + cy;
+	$(Z) = (res == 0);
+	{{ dst }} = res;
+{% endmacro %}
+
+{% macro sub(dst, src) %}
+	local op1 = {{ dst }};
+	local op2 = {{ src }};
+	local res = op1 - op2;
+	$(Z) = (op1 == op2);
+	$(AC) = ((op1 & 0xf) < (op2 & 0xf));
+	$(CY) = (op1 < op2);
+	{{ dst }} = res;
+{% endmacro %}
+
+{% macro subc(dst, src) %}
+	local op1 = {{ dst }};
+	local op2 = {{ src }};
+	local cy = $(CY);
+	local tmp = op1 - op2;
+	$(AC) = ((op1 & 0xf) < (op2 & 0xf)) || ((op1 & 0xf) < (op2 & 0xf) + cy);  # TODO: is this correct?
+	$(CY) = (0:2 + zext(op1) < 0:2 + zext(op2) + zext(cy));
+	local res = tmp - cy;
+	$(Z) = (res == 0);
+	{{ dst }} = res;
+{% endmacro %}
+
+{% macro andd(dst, src) %}
+	local op1 = {{ dst }};
+	local op2 = {{ src }};
+	local res = op1 & op2;
+	$(Z) = (res == 0);
+	{{ dst }} = res;
+{% endmacro %}
+
+{% macro orr(dst, src) %}
+	local op1 = {{ dst }};
+	local op2 = {{ src }};
+	local res = op1 | op2;
+	$(Z) = (res == 0);
+	{{ dst }} = res;
+{% endmacro %}
+
+{% macro xor(dst, src) %}
+	local op1 = {{ dst }};
+	local op2 = {{ src }};
+	local res = op1 ^ op2;
+	$(Z) = (res == 0);
+	{{ dst }} = res;
+{% endmacro %}
+
+{% macro cmp(dst, src) %}
+	local op1 = {{ dst }};
+	local op2 = {{ src }};
+	$(Z) = (op1 == op2);
+	$(AC) = ((op1 & 0xf) < (op2 & 0xf));
+	$(CY) = (op1 < op2);
+{% endmacro %}
+
+{% for fun,name,off in [(add, "ADD", 0), (addc, "ADDC", 16), (sub, "SUB", 32), (subc, "SUBC", 48),
+	(andd, "AND", 80), (orr, "OR", 96), (xor, "XOR", 112), (cmp, "CMP", 64)] %}
+	:{{ name }} A, #byte is A & op={{ off+12 }} ; byte {
+		{{ fun('A', 'byte') }}
+	}
+
+	:{{ name }} tgt_saddrb, #byte is op={{ off+10 }} ; tgt_saddrb ; byte {
+		{{ fun('tgt_saddrb', 'byte') }}
+	}
+
+	:{{ name }} A", A" is A & op=0x61 ; op={{ off+1 }} {
+		{{ fun('A', 'A') }}
+	}
+
+	{% for dst,src,op in [
+		('A','X',8),('A','C',10),('A','B',11),('A','E',12),('A','D',13),('A','L',14),('A','H',15),
+		('X','A',0),('C','A',2),('B','A',3),('E','A',4),('D','A',5),('L','A',6),('H','A',7)
+	] %}
+	:{{ name }} {{ dst }}, {{ src }} is {{ dst }} & {{ src }} & op=0x61 ; op={{ off+op }} {
+		{{ fun(dst, src) }}
+	}
+	{% endfor %}
+
+	:{{ name }} A, tgt_saddrb is A & op={{ off+11 }} ; tgt_saddrb {
+		{{ fun('A', 'tgt_saddrb') }}
+	}
+
+	:{{ name }} A, !tgt_addr16b is A & op={{ off+15 }} ; tgt_addr16b {
+		{{ fun('A', 'tgt_addr16b') }}
+	}
+
+	:{{ name }} A, [HL] is A & HL & op={{ off+13 }} {
+		local addr:4 = segment(0xF:2, HL);
+		{{ fun('A', '*:1 addr') }}
+	}
+
+	:{{ name }} A, [HL+byte] is A & HL & op={{ off+14 }} ; byte {
+		local addr:4 = segment(0xF:2, HL + byte);
+		{{ fun('A', '*:1 addr') }}
+	}
+
+	:{{ name }} A, [HL+B] is A & HL & B & op=0x61 ; op={{ off+128 }} {
+		local addr:4 = segment(0xF:2, HL + zext(B));
+		{{ fun('A', '*:1 addr') }}
+	}
+
+	:{{ name }} A, [HL+C] is A & HL & C & op=0x61 ; op={{ off+130 }} {
+		local addr:4 = segment(0xF:2, HL + zext(C));
+		{{ fun('A', '*:1 addr') }}
+	}
+
+	:{{ name }} A, tgt_esaddr16b is A & op=0x11 ; op={{ off+15 }} ; tgt_esaddr16b {
+		{{ fun('A', 'tgt_esaddr16b') }}
+	}
+
+	:{{ name }} A, ES:[HL] is A & ES & HL & op=0x11 ; op={{ off+13 }} {
+		local addr:4 = segment(ES, HL);
+		{{ fun('A', '*:1 addr') }}
+	}
+
+	:{{ name }} A, ES:[HL+byte] is A & ES & HL & op=0x11 ; op={{ off+14 }} ; byte {
+		local addr:4 = segment(ES, HL + byte);
+		{{ fun('A', '*:1 addr') }}
+	}
+
+	:{{ name }} A, ES:[HL+B] is A & ES & HL & B & op=0x11 ; op=0x61 ; op={{ off+128 }} {
+		local addr:4 = segment(ES, HL + zext(B));
+		{{ fun('A', '*:1 addr') }}
+	}
+
+	:{{ name }} A, ES:[HL+C] is A & ES & HL & C & op=0x11 ; op=0x61 ; op={{ off+130 }} {
+		local addr:4 = segment(ES, HL + zext(C));
+		{{ fun('A', '*:1 addr') }}
+	}
+{% endfor %}
+
+:CMP !tgt_addr16b, #byte is op=0x40 ; tgt_addr16b ; byte {
+	{{ cmp('tgt_addr16b', 'byte') }}
+}
+
+:CMP tgt_esaddr16b, #byte is op=0x11 ; op=0x40 ; tgt_esaddr16b ; byte {
+	{{ cmp('tgt_esaddr16b', 'byte') }}
+}
+
+{% macro cmp0(arg) %}
+	local tmp = {{ arg }};
+	$(Z) = (tmp == 0);
+	$(AC) = 0;
+	$(CY) = 0;
+{% endmacro %}
+
+:CMP0 A is op=0xD1 & A {
+	{{ cmp0('A') }}
+}
+
+:CMP0 X is op=0xD0 & X {
+	{{ cmp0('X') }}
+}
+
+:CMP0 B is op=0xD3 & B {
+	{{ cmp0('B') }}
+}
+
+:CMP0 C is op=0xD2 & C {
+	{{ cmp0('C') }}
+}
+
+:CMP0 tgt_saddrb is op=0xD4 ; tgt_saddrb {
+	{{ cmp0("tgt_saddrb") }}
+}
+
+:CMP0 !tgt_addr16b is op=0xD5 ; tgt_addr16b {
+	{{ cmp0("tgt_addr16b") }}
+}
+
+:CMP0 tgt_esaddr16b is op=0x11 ; op=0xD5 ; tgt_esaddr16b {
+	{{ cmp0("tgt_esaddr16b") }}
+}
+
+{% macro cmps(dst, src) %}
+	local op1 = {{ dst }};
+	local op2 = {{ src }};
+	$(Z) = (op1 == op2);
+	$(AC) = ((op1 & 0xf) < (op2 & 0xf));
+	$(CY) = (op1 != op2) || (A == 0) || (op1 == 0);
+{% endmacro %}
+
+:CMPS X, [HL+byte] is X & HL & op=0x61 ; op=0xDE ; byte {
+	local addr:4 = segment(0xF:2, HL + byte);
+	{{ cmps('X', '*:1 addr') }}
+}
+
+:CMPS X, ES:[HL+byte] is X & ES & HL & op=0x11 ; op=0x61 ; op=0xDE ; byte {
+	local addr:4 = segment(ES, HL + byte);
+	{{ cmps('X', '*:1 addr') }}
+}
+
+#
+# 16-bit operation
+#
+
+{% macro addw(dst,src) %}
+	local op1:2 = {{ dst }};
+	local op2:2 = {{ src }};
+	local res = op1 + op2;
+	$(Z) = (res == 0);
+	$(CY) = carry(op1, op2);
+	# AC is undefined
+	{{ dst }} = res;
+{% endmacro %}
+
+{% macro subw(dst,src) %}
+	local op1:2 = {{ dst }};
+	local op2:2 = {{ src }};
+	local res = op1 - op2;
+	$(Z) = (op1 == op2);
+	$(CY) = op1 < op2;
+	# AC is undefined
+	{{ dst }} = res;
+{% endmacro %}
+
+{% macro cmpw(dst,src) %}
+	local op1:2 = {{ dst }};
+	local op2:2 = {{ src }};
+	$(Z) = (op1 == op2);
+	$(CY) = op1 < op2;
+	# AC is undefined
+{% endmacro %}
+
+{% for fun,name,off in [(addw,'ADDW',0),(subw,'SUBW',32),(cmpw,'CMPW',64)] %}
+	:{{ name }} AX, #word is AX & op={{ 4+off }} ; word {
+		{{ fun('AX', 'word') }}
+	}
+
+	:{{ name }} AX, BC is AX & BC & op={{ 3+off }} {
+		{{ fun('AX', 'BC') }}
+	}
+
+	:{{ name }} AX, DE is AX & DE & op={{ 5+off }} {
+		{{ fun('AX', 'DE') }}
+	}
+
+	:{{ name }} AX, HL is AX & HL & op={{ 7+off }} {
+		{{ fun('AX', 'HL') }}
+	}
+
+	:{{ name }} AX, tgt_saddrw is AX & op={{ 6+off }} ; tgt_saddrw {
+		{{ fun('AX', 'tgt_saddrw') }}
+	}
+
+	:{{ name }} AX, !tgt_addr16w is AX & op={{ 2+off }} ; tgt_addr16w {
+		{{ fun('AX', 'tgt_addr16w') }}
+	}
+
+	:{{ name }} AX, [HL+byte] is AX & HL & op=0x61 ; op={{ 9+off }} ; byte {
+		local addr:4 = segment(0xF:2, HL + byte);
+		{{ fun('AX', '*:2 addr') }}
+	}
+
+	:{{ name }} AX, tgt_esaddr16w is AX & op=0x11 ; op={{ 2+off }} ; tgt_esaddr16w {
+		{{ fun('AX', 'tgt_esaddr16w') }}
+	}
+
+	:{{ name }} AX, ES:[HL+byte] is AX & ES & HL & op=0x11 ; op=0x61 ; op={{ 9+off }} ; byte {
+		local addr:4 = segment(ES, HL + byte);
+		{{ fun('AX', '*:2 addr') }}
+	}
+{% endfor %}
+
+:ADDW AX", AX" is AX & op=0x01 {
+	{{ addw('AX', 'AX') }}
+}
+
+#
+# Multiply
+#
+
+:MULU X is X & op=0xD6 {
+	local op1:2 = zext(X);
+	local op2:2 = zext(A);
+	AX = op1 * op2;
+}
+
+# TODO: unimplemented: MULHU, MULH, DIVHU, DIVWU, MACHU, MACH
+
+#
+# Increment/decrement
+#
+
+{% macro inc(dst) %}
+	local tmp:1 = {{ dst }};
+	$(AC) = ((tmp & 0xF) == 0xF);
+	tmp = tmp + 1;
+	$(Z) = (tmp == 0);
+	{{ dst }} = tmp;
+{% endmacro %}
+
+{% macro dec(dst) %}
+	local tmp = {{ dst }};
+	$(AC) = ((tmp & 0xF) == 0x0);
+	tmp = tmp - 1;
+	$(Z) = (tmp == 0);
+	{{ dst }} = tmp;
+{% endmacro %}
+
+{% for fun,name,off in [(inc,'INC',0),(dec,'DEC',16)] %}
+	{% for reg, op in [('X',128), ('A',129), ('C',130), ('B',131), ('E',132), ('D',133), ('L',134), ('H',135)] %}
+	:{{ name }} {{ reg }} is op={{ off+op }} & {{ reg }} {
+		{{ fun(reg) }}
+	}
+	{% endfor %}
+
+	:{{ name }} tgt_saddrb is op={{ off+164 }} ; tgt_saddrb {
+		{{ fun("tgt_saddrb") }}
+	}
+
+	:{{ name }} tgt_addr16b is op={{ off+160 }} ; tgt_addr16b {
+		{{ fun("tgt_addr16b") }}
+	}
+
+	:{{ name }} [HL+byte] is HL & op=0x61 ; op={{ off+89 }} ; byte {
+		local addr:4 = segment(0xF:2, HL + byte);
+		{{ fun("*:1 addr") }}
+	}
+
+	:{{ name }} tgt_esaddr16b is op=0x11 ; op={{ off+160 }} ; tgt_esaddr16b {
+		{{ fun("tgt_esaddr16b") }}
+	}
+
+	:{{ name }} ES:[HL+byte] is ES & HL & op=0x11 ; op=0x61 ; op={{ off+89 }} ; byte {
+		local addr:4 = segment(ES, HL + byte);
+		{{ fun("*:1 addr") }}
+	}
+{% endfor %}
+
+{% macro incw(dst) %}
+	local tmp:2 = {{ dst }};
+	tmp = tmp + 1;
+	{{ dst }} = tmp;
+{% endmacro %}
+
+{% macro decw(dst) %}
+	local tmp:2 = {{ dst }};
+	tmp = tmp - 1;
+	{{ dst }} = tmp;
+{% endmacro %}
+
+{% for fun,name,off in [(incw,"INCW",0),(decw,"DECW",16)] %}
+	:{{ name }} AX is AX & op={{ 161+off }} {
+		{{ fun('AX') }}
+	}
+	:{{ name }} BC is BC & op={{ 163+off }} {
+		{{ fun('BC') }}
+	}
+	:{{ name }} DE is DE & op={{ 165+off }} {
+		{{ fun('DE') }}
+	}
+	:{{ name }} HL is HL & op={{ 167+off }} {
+		{{ fun('HL') }}
+	}
+
+	:{{ name }} tgt_saddrw is op={{ 166+off }} ; tgt_saddrw {
+		{{ fun('tgt_saddrw') }}
+	}
+
+	:{{ name }} !tgt_addr16w is op={{ 162+off }} ; tgt_addr16w {
+		{{ fun("tgt_addr16w") }}
+	}
+
+	:{{ name }} [HL+byte] is HL & op=0x61 ; op={{ 121+off }} ; byte {
+		local addr:4 = segment(0xF:2, HL + byte);
+		{{ fun("*:2 addr")  }}
+	}
+
+	:{{ name }} tgt_esaddr16w is op=0x11 ; op={{ 162+off }} ; tgt_esaddr16w {
+		{{ fun("tgt_esaddr16w") }}
+	}
+
+	:{{ name }} ES:[HL+byte] is ES & HL & op=0x11 ; op=0x61 ; op={{ 121+off }} ; byte {
+		local addr:4 = segment(ES, HL + byte);
+		{{ fun("*:2 addr") }}
+	}
+{% endfor %}
+
+#
+# Shift
+#
+
+{% macro shr(cnt) %}
+	$(CY) = (A >> {{ cnt - 1 }}) & 1;
+	A = A >> {{ cnt }};
+{% endmacro %}
+
+{% for cnt in range(1, 8) %}
+:SHR A, {{ cnt }} is A & op=0x31 ; op={{ 10 + 16*cnt }} {
+	{{ shr(cnt) }}
+}
+{% endfor %}
+
+{% macro shrw(cnt) %}
+	local tmp:2 = (AX >> {{ cnt - 1 }});
+	$(CY) = tmp[0,1];
+	AX = AX >> {{ cnt }};
+{% endmacro %}
+
+{% for cnt in range(1, 16) %}
+:SHRW AX, {{ cnt }} is AX & op=0x31 ; op={{ 14 + 16*cnt }} {
+	{{ shrw(cnt) }}
+}
+{% endfor %}
+
+{% macro shl(dst,cnt) %}
+	local tmp = {{ dst }};
+	$(CY) = (tmp >> {{ 8 - cnt }}) & 1;
+	tmp = tmp << {{ cnt }};
+	{{ dst }} = tmp;
+{% endmacro %}
+
+{% for reg,off in [('A',9), ('B',8), ('C',7)] %}
+{% for cnt in range(1, 8) %}
+	:SHL {{ reg }}, {{ cnt }} is {{ reg }} & op=0x31 ; op={{ 16*cnt + off }} {
+		{{ shl(reg,cnt) }}
+	}
+{% endfor %}
+{% endfor %}
+
+{% macro shlw(dst,cnt) %}
+	$(CY) = {{ dst }}[{{ 16 - cnt }},1];
+	{{ dst }} = {{ dst }} << {{ cnt }};
+{% endmacro %}
+
+{% for reg,off in [('AX',13),('BC',12)] %}
+{% for cnt in range(1, 16) %}
+	:SHLW {{ reg }}, {{ cnt }} is {{ reg }} & op=0x31 ; op={{ 16*cnt + off }} {
+		{{ shlw(reg, cnt) }}
+	}
+{% endfor %}
+{% endfor %}
+
+{% macro sar(cnt) %}
+	$(CY) = A[{{ cnt-1 }},1];
+	A = A s>> {{ cnt }};
+{% endmacro %}
+
+{% for cnt in range(1, 8) %}
+	:SAR A, {{ cnt }} is A & op=0x31 ; op={{ 11+16*cnt }} {
+		{{ sar(cnt) }}
+	}
+{% endfor %}
+
+{% macro sarw(cnt) %}
+	$(CY) = AX[{{ cnt-1 }},1];
+	AX = AX s>> {{ cnt }};
+{% endmacro %}
+
+{% for cnt in range(1, 16) %}
+	:SARW AX, {{ cnt }} is AX & op=0x31 ; op={{ 15+16*cnt }} {
+		{{ sarw(cnt) }}
+	}
+{% endfor %}
+
+#
+# Rotate
+#
+
+:ROR A, 1 is A & op=0x61 ; op=0xDB {
+	local cy = A & 1;
+	A = (A >> 1) | (cy << 7);
+	$(CY) = cy;
+}
+
+:ROL A, 1 is A & op=0x61 ; op=0xEB {
+	local cy = A >> 7;
+	A = (A << 1) | cy;
+	$(CY) = cy;
+}
+
+:RORC A, 1 is A & op=0x61 ; op=0xFB {
+	local cy = A & 1;
+	A = (A >> 1) | ($(CY) << 7);
+	$(CY) = cy;
+}
+
+:ROLC A, 1 is A & op=0x61 ; op=0xDC {
+	local cy = A >> 7;
+	A = (A << 1) | $(CY);
+	$(CY) = cy;
+}
+
+:ROLWC AX, 1 is AX & op=0x61 ; op=0xEE {
+	local cy = AX >> 15;
+	AX = (AX << 1) | zext($(CY));
+	$(CY) = cy[0,1];
+}
+
+:ROLWC BC, 1 is BC & op=0x61 ; op=0xFE {
+	local cy = BC >> 15;
+	BC = (BC << 1) | zext($(CY));
+	$(CY) = cy[0,1];
+}
+
+#
+# Bit manipulate
+#
+
+{% macro mov1_tobit(dst,src,bit) %}
+	local src = {{ src }};
+	src = (src >> {{ bit }}) & 1;
+	{{ dst }} = src;
+{% endmacro %}
+
+{% macro mov1_frombit(dst,src,bit) %}
+	local src = {{ src }};
+	local dst = {{ dst }};
+	src = src << {{ bit }};
+	dst = dst & ~(1 << {{ bit }});
+	dst = dst | src;
+	{{ dst }} = dst;
+{% endmacro %}
+
+{% for bit in range(8) %}
+:MOV1 "CY", tgt_saddrb".{{bit}}" is op=0x71 ; op={{ 4+bit*16 }} ; tgt_saddrb {
+	{{ mov1_tobit('$(CY)', 'tgt_saddrb', bit) }}
+}
+
+:MOV1 "CY", tgt_sfrb".{{bit}}" is op=0x71 ; op={{ 12+bit*16 }} ; tgt_sfrb {
+	{{ mov1_tobit('$(CY)', 'tgt_sfrb', bit) }}
+}
+
+:MOV1 "CY", A".{{bit}}" is A & op=0x71 ; op={{ 140+bit*16 }} {
+	{{ mov1_tobit('$(CY)', 'A', bit) }}
+}
+
+:MOV1 "CY", PSW".{{bit}}" is PSW & op=0x71 ; op={{ 12+bit*16 }} ; op=0xFA {
+	{{ mov1_tobit('$(CY)', 'PSW', bit) }}
+}
+
+:MOV1 "CY", [HL]".{{bit}}" is HL & op=0x71 ; op={{ 132+bit*16 }} {
+	local addr:4 = segment(0xF:2, HL);
+	{{ mov1_tobit('$(CY)', '*:1 addr', bit) }}
+}
+
+:MOV1 tgt_saddrb".{{bit}}", "CY" is op=0x71 ; op={{ 1+bit*16 }} ; tgt_saddrb {
+	{{ mov1_frombit('tgt_saddrb', '$(CY)', bit) }}
+}
+
+:MOV1 tgt_sfrb".{{bit}}", "CY" is op=0x71 ; op={{ 9+bit*16 }} ; tgt_sfrb {
+	{{ mov1_frombit('tgt_sfrb', '$(CY)', bit) }}
+}
+
+:MOV1 A".{{bit}}", "CY" is A & op=0x71 ; op={{ 137+bit*16 }} {
+	{{ mov1_frombit('A', '$(CY)', bit) }}
+}
+
+:MOV1 PSW".{{bit}}", "CY" is PSW & op=0x71 ; op={{ 9+bit*16 }} ; op=0xFA {
+	{{ mov1_frombit('PSW', '$(CY)', bit) }}
+}
+
+:MOV1 [HL]".{{bit}}", "CY" is HL & op=0x71 ; op={{ 129+bit*16 }} {
+	local addr:4 = segment(0xF:2, HL);
+	{{ mov1_frombit('*:1 addr', '$(CY)', bit) }}
+}
+
+:MOV1 "CY", ES:[HL]".{{bit}}" is ES & HL & op=0x11 ; op=0x71 ; op={{ 132+bit*16 }} {
+	local addr:4 = segment(ES, HL);
+	{{ mov1_tobit('$(CY)', '*:1 addr', bit) }}
+}
+
+:MOV1 ES:[HL]".{{bit}}", "CY" is ES & HL & op=0x11 ; op=0x71 ; op={{ 129+bit*16 }} {
+	local addr:4 = segment(ES, HL);
+	{{ mov1_frombit('*:1 addr', '$(CY)', bit) }}
+}
+{% endfor %}
+
+{% macro and1(src,bit) %}
+	local tmp:1 = {{ src }};
+	tmp = tmp[{{ bit }},1];
+	local cy = $(CY);
+	cy = cy & tmp;
+	$(CY) = cy;
+{% endmacro %}
+
+{% macro or1(src,bit) %}
+	local tmp:1 = {{ src }};
+	tmp = tmp[{{ bit }},1];
+	local cy = $(CY);
+	cy = cy | tmp;
+	$(CY) = cy;
+{% endmacro %}
+
+{% macro xor1(src,bit) %}
+	local tmp:1 = {{ src }};
+	tmp = tmp[{{ bit }},1];
+	local cy = $(CY);
+	cy = cy ^ tmp;
+	$(CY) = cy;
+{% endmacro %}
+
+{% macro set1(dst,bit) %}
+	local tmp = {{ dst }};
+	tmp = tmp | (1 << {{ bit }});
+	{{ dst }} = tmp;
+{% endmacro %}
+
+{% macro clr1(dst,bit) %}
+	local tmp = {{ dst }};
+	tmp = tmp & ~(1 << {{ bit }});
+	{{ dst }} = tmp;
+{% endmacro %}
+
+{% for fun,name,pfx,off in [(and1,"AND1",'"CY",',5),(or1,"OR1",'"CY",',6),(xor1,"XOR1",'"CY",',7),
+	(set1,"SET1",'',2),(clr1,"CLR1",'',3)] %}
+	{% for bit in range(8) %}
+		:{{ name }} {{ pfx }} tgt_saddrb".{{bit}}" is op=0x71 ; op={{ off+16*bit }} ; tgt_saddrb {
+			{{ fun('tgt_saddrb', bit) }}
+		}
+	{% endfor %}
+
+	{% for bit in range(8) %}
+		:{{ name }} {{ pfx }} tgt_sfrb".{{bit}}" is op=0x71 ; op={{ 8+off+16*bit }} ; tgt_sfrb {
+			{{ fun('tgt_sfrb', bit) }}
+		}
+	{% endfor %}
+
+	{% for bit in range(8) %}
+		:{{ name }} {{ pfx }} A".{{bit}}" is A & op=0x71 ; op={{ 136+off+16*bit }} {
+			{{ fun('A', bit) }}
+		}
+	{% endfor %}
+
+	{% for bit in range(8) %}
+		:{{ name }} {{ pfx }} PSW".{{bit}}" is PSW & op=0x71 ; op={{ 8+off+16*bit }} ; op=0xFA {
+			{{ fun('PSW', bit) }}
+		}
+	{% endfor %}
+
+	{% for bit in range(8) %}
+		:{{ name }} {{ pfx }} [HL]".{{bit}}" is HL & op=0x71 ; op={{ 128+off+16*bit }} {
+			local addr:4 = segment(0xF:2, HL);
+			{{ fun('*:1 addr', bit) }}
+		}
+	{% endfor %}
+
+	{% for bit in range(8) %}
+		:{{ name }} {{ pfx }} ES:[HL]".{{bit}}" is ES & HL & op=0x11 ; op=0x71 ; op={{ 128+off+16*bit }} {
+			local addr:4 = segment(ES, HL);
+			{{ fun('*:1 addr', bit) }}
+		}
+	{% endfor %}
+{% endfor %}
+
+{% for fun,name,off in [(set1,"SET1",0),(clr1,"CLR1",8)] %}
+	{% for bit in range(8) %}
+		:{{ name }} !tgt_addr16b".{{bit}}" is op=0x71 ; op={{ off+0+16*bit }} ; tgt_addr16b {
+			{{ fun("tgt_addr16b", bit) }}
+		}
+
+		:{{ name }} tgt_esaddr16b".{{bit}}" is op=0x11 ; op=0x71 ; op={{ off+0+16*bit }} ; tgt_esaddr16b {
+			{{ fun("tgt_esaddr16b", bit) }}
+		}
+	{% endfor %}
+{% endfor %}
+
+:SET1 "CY" is op=0x71 ; op=0x80 {
+	$(CY) = 1;
+}
+
+:CLR1 "CY" is op=0x71 ; op=0x88 {
+	$(CY) = 0;
+}
+
+:NOT1 "CY" is op=0x71 ; op=0xC0 {
+	$(CY) = !$(CY);
+}
+
+#
+# Call/return
+#
+
+{% for reg,op in [('AX','0xCA'),('BC','0xDA'),('DE','0xEA'),('HL','0xFA')] %}
+:CALL {{reg}} is {{reg}} & op=0x61 ; op={{op}} {
+	SP = SP - 4;
+	local addr:4 = segment(0xF:2, SP);
+	*:3 addr = inst_next;
+	local tgt:4 = segment(CS, {{ reg }});
+	call [tgt];
+}
+{% endfor %}
+
+:CALL $!tgt_rel16 is op=0xFE ; tgt_rel16 {
+	SP = SP - 4;
+	local addr:4 = segment(0xF:2, SP);
+	*:3 addr = inst_next;
+	call tgt_rel16;
+}
+
+:CALL !tgt_addr16_0 is op=0xFD ; tgt_addr16_0 {
+	SP = SP - 4;
+	local addr:4 = segment(0xF:2, SP);
+	*:3 addr = inst_next;
+	call tgt_addr16_0;
+}
+
+:CALL !!tgt_addr20 is op=0xFC ; tgt_addr20 {
+	SP = SP - 4;
+	local addr:4 = segment(0xF:2, SP);
+	*:3 addr = inst_next;
+	call tgt_addr20;
+}
+
+# TODO: CALLT
+
+:BRK is op=0x61 ; op=0xCC {
+	local addr:4 = segment(0xF:2, SP);
+	*:1 (addr - 1) = PSW;
+	*:3 (addr - 4) = inst_next;
+	SP = SP - 4;
+	$(IE) = 0;
+	local tmp = *:2 0x7e:4;
+	call [tmp];
+}
+
+:RET is op=0xD7 {
+	local addr:4 = segment(0xF:2, SP);
+	PC = *:3 addr;
+	SP = SP + 4;
+	return [PC];
+}
+
+:RETI is op=0x61 ; op=0xFC {
+	local addr:4 = segment(0xF:2, SP);
+	PC = *:3 addr;
+	PSW = *:1 (addr + 3);
+	SP = SP + 4;
+	return [PC];
+}
+
+:RETB is op=0x61 ; op=0xEC {
+	local addr:4 = segment(0xF:2, SP);
+	PC = *:3 addr;
+	PSW = *:1 (addr + 3);
+	SP = SP + 4;
+	return [PC];
+}
+
+#
+# Stack manipulate
+#
+
+:PUSH PSW is PSW & op=0x61 ; op=0xDD {
+	local addr:4 = segment(0xF:2, SP);
+	*:1 (addr - 1) = PSW;
+	*:1 (addr - 2) = 0;
+	SP = SP - 2;
+}
+
+{% for reg, op in [('AX','0xC1'), ('BC','0xC3'), ('DE','0xC5'), ('HL','0xC7')] %}
+:PUSH {{ reg }} is op={{ op }} & {{ reg }} {
+	SP = SP - 2;
+	local addr:4 = segment(0xF:2, SP);
+	*:2 addr = {{ reg }};
+}
+{% endfor %}
+
+:POP PSW is PSW & op=0x61 ; op=0xCD {
+	local addr:4 = segment(0xF:2, SP) + 1;
+	PSW = *:1 addr;
+	SP = SP + 2;
+}
+
+{% for reg, op in [('AX','0xC0'), ('BC','0xC2'), ('DE','0xC4'), ('HL','0xC6')] %}
+:POP {{ reg }} is op={{ op }} & {{ reg }} {
+	local addr:4 = segment(0xF:2, SP);
+	{{ reg }} = *:2 addr;
+	SP = SP + 2;
+}
+{% endfor %}
+
+:MOVW SP, #word is SP & op=0xCB ; op=0xF8 ; word {
+	SP = word;
+}
+
+:MOVW SP, AX is SP & AX & op=0xBE ; op=0xF8 {
+	SP = AX;
+}
+
+:MOVW AX, SP is AX & SP & op=0xAE ; op=0xF8 {
+	AX = SP;
+}
+
+:MOVW BC, SP is BC & SP & op=0xDB ; op=0xF8 ; op=0xFF {
+	BC = SP;
+}
+
+:MOVW DE, SP is DE & SP & op=0xEB ; op=0xF8 ; op=0xFF {
+	DE = SP;
+}
+
+:MOVW HL, SP is HL & SP & op=0xFB ; op=0xF8 ; op=0xFF {
+	HL = SP;
+}
+
+:ADDW SP, #byte is SP & op=0x10 ; byte {
+	SP = SP + byte;
+}
+
+:SUBW SP, #byte is SP & op=0x20 ; byte {
+	SP = SP - byte;
+}
+
+
+#
+# Unconditional branch
+#
+
+:BR AX is AX & op=0x61 ; op=0xCB {
+	local tgt:4 = segment(CS, AX);
+	goto [tgt];
+}
+
+:BR $tgt_rel8 is op=0xEF ; tgt_rel8 {
+	goto tgt_rel8;
+}
+
+:BR $!tgt_rel16 is op=0xEE ; tgt_rel16 {
+	goto tgt_rel16;
+}
+
+:BR !tgt_addr16d is op=0xED ; tgt_addr16d {
+	goto tgt_addr16d;
+}
+
+:BR !!tgt_addr20 is op=0xEC ; tgt_addr20 {
+	goto tgt_addr20;
+}
+
+#
+# Conditional branch
+#
+
+:BC tgt_rel8 is op=0xDC ; tgt_rel8 { if ($(CY) == 1) goto tgt_rel8; }
+:BNC tgt_rel8 is op=0xDE ; tgt_rel8 { if ($(CY) == 0) goto tgt_rel8; }
+:BZ tgt_rel8 is op=0xDD ; tgt_rel8 { if ($(Z) == 1) goto tgt_rel8; }
+:BNZ tgt_rel8 is op=0xDF ; tgt_rel8 { if ($(Z) == 0) goto tgt_rel8; }
+:BH tgt_rel8 is op=0x61 ; op=0xC3 ; tgt_rel8 { if (($(Z) || $(CY)) == 0) goto tgt_rel8; }
+:BNH tgt_rel8 is op=0x61 ; op=0xD3 ; tgt_rel8 { if (($(Z) || $(CY)) == 1) goto tgt_rel8; }
+
+{% macro bt(data, bit) %}
+	local data:1 = {{ data }};
+	if (data[{{bit}},1] == 1) goto tgt_rel8;
+{% endmacro %}
+
+{% macro bf(data, bit) %}
+	local data:1 = {{ data }};
+	if (data[{{bit}},1] == 0) goto tgt_rel8;
+{% endmacro %}
+
+{% macro btclr(data, bit) %}
+	local data:1 = {{ data }};
+	local new = data;
+	new[{{bit}},1] = 0;
+	{{ data }} = new;
+	if (data[{{bit}},1] == 1) goto tgt_rel8;
+{% endmacro %}
+
+{% for fun,name,off in [(bt,"BT",2),(bf,"BF",4),(btclr,"BTCLR",0)] %}
+	{% for bit in range(8) %}
+		:{{name}} tgt_saddrb".{{bit}}", $tgt_rel8 is op=0x31 ; op={{ off+bit*16 }} ; tgt_saddrb ; tgt_rel8 {
+			{{ fun('tgt_saddrb', bit) }}
+		}
+
+		:{{name}} tgt_sfrb".{{bit}}", $tgt_rel8 is op=0x31 ; op={{ off+128+bit*16 }} ; tgt_sfrb ; tgt_rel8 {
+			{{ fun('tgt_sfrb', bit) }}
+		}
+
+		:{{name}} A".{{bit}}", $tgt_rel8 is A & op=0x31 ; op={{ off+1+bit*16 }} ; tgt_rel8 {
+			{{ fun('A', bit) }}
+		}
+
+		:{{name}} PSW".{{bit}}", $tgt_rel8 is PSW & op=0x31 ; op={{ off+128+bit*16 }} ; op=0xFA ; tgt_rel8 {
+			{{ fun('PSW', bit) }}
+		}
+
+		:{{name}} [HL]".{{bit}}", $tgt_rel8 is HL & op=0x31 ; op={{ off+129+bit*16 }} ; tgt_rel8 {
+			local addr:4 = segment(0xF:2, HL);
+			{{ fun('*:1 addr', bit) }}
+		}
+
+		:{{name}} ES:[HL]".{{bit}}", $tgt_rel8 is ES & HL & op=0x11 ; op=0x31 ; op={{ off+129+bit*16 }} ; tgt_rel8 {
+			local addr:4 = segment(ES, HL);
+			{{ fun('*:1 addr', bit) }}
+		}
+	{% endfor %}
+{% endfor %}
+
+#
+# Conditional skip
+#
+
+:SKC is op=0x61 ; op=0xC8 [ cond_skc = 1; globalset(inst_next, cond_skc); ] {}
+:SKNC is op=0x61 ; op=0xD8 [ cond_sknc = 1; globalset(inst_next, cond_sknc); ] {}
+:SKZ is op=0x61 ; op=0xE8 [ cond_skz = 1; globalset(inst_next, cond_skz); ] {}
+:SKNZ is op=0x61 ; op=0xF8 [ cond_sknz = 1; globalset(inst_next, cond_sknz); ] {}
+:SKH is op=0x61 ; op=0xE3 [ cond_skh = 1; globalset(inst_next, cond_skh); ] {}
+:SKNH is op=0x61 ; op=0xF3 [ cond_sknh = 1; globalset(inst_next, cond_sknh); ] {}
+
+#
+# CPU control
+#
+
+:"SEL RB0" is op=0x61 ; op=0xCF {
+	sel(0:1);
+}
+:"SEL RB1" is op=0x61 ; op=0xDF {
+	sel(1:1);
+}
+:"SEL RB2" is op=0x61 ; op=0xEF {
+	sel(2:1);
+}
+:"SEL RB3" is op=0x61 ; op=0xFF {
+	sel(3:1);
+}
+
+:NOP is op=0x00 {
+}
+
+# EI, DI covered by SET1 PSW.7, CLR1 PSW.7
+
+:HALT is op=0x61 ; op=0xED {
+	halt();
+}
+
+:STOP is op=0x61 ; op=0xFD {
+	stop();
+}

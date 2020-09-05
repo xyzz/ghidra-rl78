@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<language_definitions>
+  <language processor="rl78"
+            endian="little"
+            size="16"
+            variant="default"
+            version="1.0"
+            slafile="rl78.sla"
+            processorspec="rl78.pspec"
+            id="RL78:LE:16:default">
+    <description>RL78 processor 16-bit little-endian</description>
+    <compiler name="default" spec="rl78.cspec" id="default"/>
+  </language>
+</language_definitions>
