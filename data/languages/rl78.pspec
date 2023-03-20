@@ -8,7 +8,7 @@
       <input name="base" size="2"/>
       <output name="res" size="4"/>
       <body><![CDATA[
-        res = (zext(base) << 16) + zext(inner);
+        res = (zext(inner) << 16) + zext(base);
       ]]></body>
     </pcode>
   </segmentop>
