@@ -31,24 +31,34 @@
   </returnaddress>
   <default_proto>
     <prototype name="__stdcall" extrapop="unknown" stackshift="4">
-      <input>
-        <pentry minsize="1" maxsize="2" extension="inttype">
+      <input killedbycall="true" pointermax="4">
+        <pentry minsize="1" maxsize="2">
           <register name="AX"/>
         </pentry>
-        <pentry minsize="1" maxsize="2" extension="inttype">
+        <pentry minsize="1" maxsize="2">
           <register name="BC"/>
         </pentry>
-        <pentry minsize="1" maxsize="500" align="1">
+        <pentry minsize="3" maxsize="3">
+          <addr space="join" piece1="C" piece2="AX"/>
+        </pentry>
+        <pentry minsize="4" maxsize="4">
+          <addr space="join" piece1="DE" piece2="BC"/>
+        </pentry>
+        <pentry minsize="1" maxsize="500" align="2">
           <addr offset="4" space="stack"/>
         </pentry>
       </input>
-      <output>
-        <pentry minsize="1" maxsize="2" extension="inttype">
+      <output killedbycall="true">
+        <pentry minsize="1" maxsize="1">
+          <register name="A"/>
+        </pentry>
+        <pentry minsize="2" maxsize="2">
           <register name="BC"/>
         </pentry>
       </output>
       <unaffected>
         <register name="HL"/>
+        <register name="SP"/>
       </unaffected>
     </prototype>
   </default_proto>
