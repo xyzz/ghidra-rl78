@@ -1757,8 +1757,8 @@ tgt_sfrw: target is addr_abs8 [ target = 0xfff00 + addr_abs8; ] { export *:2 tar
 	goto tgt_rel16;
 }
 
-:BR !tgt_addr16d is op=0xED ; tgt_addr16d {
-	goto tgt_addr16d;
+:BR !tgt_addr16_0 is op=0xED ; tgt_addr16_0 {
+	goto tgt_addr16_0;
 }
 
 :BR !!tgt_addr20 is op=0xEC ; tgt_addr20 {

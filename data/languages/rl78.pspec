@@ -4,8 +4,8 @@
   <programcounter register="PC"/>
   <segmentop space="memory" userop="segment" farpointer="yes">
     <pcode>
-      <input name="inner" size="2"/>
       <input name="base" size="2"/>
+      <input name="inner" size="2"/>
       <output name="res" size="4"/>
       <body><![CDATA[
         res = (zext(base) << 16) + zext(inner);
